@@ -1,10 +1,16 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mkdtemp, rm, readFile } = require("fs/promises");
+const { mkdtemp, rm, readFile, writeFile, mkdir } = require("fs/promises");
 const { tmpdir } = require("node:os");
 const path = require("node:path");
 
-const { createApp, analyzeAcoustic, parseFrequency, MIN_VALID_SAMPLES } = require("../server.js");
+const {
+  createApp,
+  analyzeAcoustic,
+  parseFrequency,
+  beatErrorFromPairs,
+  MIN_VALID_SAMPLES
+} = require("../server.js");
 
 const BASE = "/clocks/clock_demo";
 
@@ -111,12 +117,15 @@ test("节拍偏快/偏慢给出有符号日差，并触发关注或异常分级"
   // 126ms vs 125ms 期望 -> 周期变长、日差为正（走慢）
   const slow = analyzeAcoustic({ vph: 28800, ...makeSamples(30, { interval: 126, jitter: 0 }) });
   assert.ok(slow.metrics.dailyRateSeconds > 0);
-  assert.ok(slow.metrics.beatErrorMs > 0);
+  // 左右完全对称（无交替失衡）时，节拍偏差为 0 且可用——偏差只体现在日差上
+  assert.equal(slow.metrics.beatErrorMs, 0);
+  assert.equal(slow.metrics.beatErrorAvailable, true);
+  assert.ok(slow.metrics.beatPairCount >= 20);
 
   // 124.9ms -> 周期变短、日差为负（走快）
   const fast = analyzeAcoustic({ vph: 28800, ...makeSamples(30, { interval: 124.9, jitter: 0 }) });
   assert.ok(fast.metrics.dailyRateSeconds < 0);
-  assert.ok(fast.metrics.beatErrorMs < 0);
+  assert.equal(fast.metrics.beatErrorMs, 0);
 
   // 轻微偏差（约 +69s/天）-> 超过 60s 阈值，异常
   const abnormal = analyzeAcoustic({ vph: 28800, ...makeSamples(30, { interval: 125.1, jitter: 0 }) });
@@ -127,6 +136,54 @@ test("节拍偏快/偏慢给出有符号日差，并触发关注或异常分级"
   const attention = analyzeAcoustic({ vph: 28800, ...makeSamples(30, { interval: 125.05, jitter: 0 }) });
   assert.ok(attention.metrics.dailyRateSeconds > 20 && attention.metrics.dailyRateSeconds <= 60);
   assert.equal(attention.status, "attention");
+});
+
+test("左右交替失衡：平均值相互抵消为零，节拍偏差仍能揭示失衡（日差不动）", () => {
+  // 124/126 严格交替：平均周期正好 125，旧口径（平均−目标）会报 0；
+  // 新口径按相邻左右对 |左−右|/2 跨对取中位数，应报 1ms。
+  const n = 30;
+  const tickIntervalsMs = Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 124 : 126));
+  const amplitudesDeg = Array(n).fill(270);
+  const result = analyzeAcoustic({ vph: 28800, tickIntervalsMs, amplitudesDeg });
+
+  assert.equal(result.metrics.beatErrorAvailable, true);
+  assert.equal(result.metrics.beatPairCount, n - 1); // 全部相邻成对
+  assert.ok(Math.abs(result.metrics.beatErrorMs - 1) < 1e-9, `beatError=${result.metrics.beatErrorMs}`);
+  // 平均仍是 125 -> 日差为 0，证明节拍偏差不再被左右抵消
+  assert.ok(Math.abs(result.metrics.dailyRateSeconds) < 1e-9);
+  assert.equal(result.metrics.avgIntervalMs, 125);
+});
+
+test("离群点打断相邻对：不跨离群点配对，离群滴答不污染节拍偏差", () => {
+  const n = 30;
+  const tickIntervalsMs = Array.from({ length: n }, (_, i) => (i % 2 === 0 ? 124 : 126));
+  tickIntervalsMs[10] = 400; // 一个漏跳离群点，打断 (9,10)、(10,11) 两对
+  const amplitudesDeg = Array(n).fill(270);
+  const result = analyzeAcoustic({ vph: 28800, tickIntervalsMs, amplitudesDeg });
+
+  assert.equal(result.outlierCount, 1);
+  assert.equal(result.cleanedSampleCount, 29);
+  // 30 点本有 29 条相邻边，去掉与离群点相连的 (9,10)、(10,11) 两条 -> 27 对
+  assert.equal(result.metrics.beatPairCount, 27);
+  // 400ms 的离群值绝不进入任何对：失衡中位数仍是 1ms 而不是约 137ms
+  assert.ok(Math.abs(result.metrics.beatErrorMs - 1) < 1e-9);
+});
+
+test("成对缺失：有效滴答互不相邻（0 对）时节拍偏差标记为不可用而非 0", () => {
+  // 有效索引 0/2/4 中间各隔一个被剔除点 -> 没有任何相邻对
+  const result = beatErrorFromPairs({ kept: [0, 2, 4], intervals: [124, 126, 124], amplitudes: [270, 270, 270] });
+  assert.equal(result.beatPairCount, 0);
+  assert.equal(result.beatErrorAvailable, false);
+  assert.equal(result.beatErrorMs, null);
+
+  // 部分连续：(0,1) 成一对、索引 1→3 跨越缺口不成对、(3,4) 成一对
+  const partial = beatErrorFromPairs({
+    kept: [0, 1, 3, 4],
+    intervals: [124, 126, 124, 126],
+    amplitudes: [270, 270, 270, 270]
+  });
+  assert.equal(partial.beatPairCount, 2);
+  assert.ok(Math.abs(partial.beatErrorMs - 1) < 1e-9);
 });
 
 test("摆幅不足判为异常，摆幅偏低判为关注", () => {
@@ -403,13 +460,19 @@ test("服务重启后体检结论与复核版本仍然存在", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "acoustic-restart-"));
   const dbFile = path.join(dir, "db.json");
   let checkupId;
+  const payload = makeSamples(24);
   try {
     {
       const app = createApp(dbFile);
       await new Promise((r) => app.server.listen(0, "127.0.0.1", r));
       const base = `http://127.0.0.1:${app.server.address().port}`;
-      const created = await api(base, "POST", `${BASE}/acoustic-checkups`, makeSamples(24));
+      const created = await api(base, "POST", `${BASE}/acoustic-checkups`, payload);
       checkupId = created.json.data.id;
+      // 提交即返回完整、有序的原始滴答与摆幅序列
+      assert.equal(created.json.data.rawSamplesAvailable, true);
+      assert.deepEqual(created.json.data.tickIntervalsMs, payload.tickIntervalsMs);
+      assert.deepEqual(created.json.data.amplitudesDeg, payload.amplitudesDeg);
+      assert.equal(created.json.data.tickIntervalsMs.length, 24);
       await api(base, "POST", `/acoustic-checkups/${checkupId}/reviews`, {
         action: "overturn",
         newStatus: "attention",
@@ -427,9 +490,198 @@ test("服务重启后体检结论与复核版本仍然存在", async () => {
       assert.equal(detail.json.data.status, "attention");
       assert.equal(detail.json.data.versions.length, 2);
       assert.match(detail.json.data.versions[1].reason, /重启持久化验证用/);
+      // 重启后原序列仍完整、有序可复核
+      assert.equal(detail.json.data.rawSamplesAvailable, true);
+      assert.deepEqual(detail.json.data.tickIntervalsMs, payload.tickIntervalsMs);
+      assert.deepEqual(detail.json.data.amplitudesDeg, payload.amplitudesDeg);
       await new Promise((res, rej) => app.server.close((e) => (e ? rej(e) : res())));
     }
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------- 旧数据迁移：缺原序列的历史体检 ------------------- */
+
+function legacyCheckup(overrides = {}) {
+  return {
+    id: makeIdLocal("acoustic_legacy"),
+    clockId: "clock_demo",
+    fingerprint: "fp_legacy_" + Math.random().toString(36).slice(2),
+    vph: 28800,
+    balanceFrequency: "28800vph",
+    sampleCount: 24,
+    cleanedSampleCount: 24,
+    outlierCount: 0,
+    outlierIndexes: [],
+    // 旧记录没有 tickIntervalsMs / amplitudesDeg
+    metrics: {
+      expectedIntervalMs: 125,
+      avgIntervalMs: 125,
+      beatErrorMs: 0,
+      dailyRateSeconds: 0,
+      intervalNoiseMs: 0,
+      noiseRatioPercent: 0,
+      stabilityPercent: 100,
+      avgAmplitudeDeg: 270
+    },
+    status: "attention",
+    statusLabel: "关注",
+    note: "迁移前的老体检",
+    createdAt: "2026-06-16T00:00:00.000Z",
+    reviews: [],
+    versions: [
+      { version: 1, status: "attention", statusLabel: "关注", reason: "首次体检结论", reviewer: "system", createdAt: "2026-06-16T00:00:00.000Z" }
+    ],
+    ...overrides
+  };
+}
+
+function makeIdLocal(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function writeDbFile(dbFile, data) {
+  await mkdir(path.dirname(dbFile), { recursive: true });
+  await writeFile(dbFile, JSON.stringify(data, null, 2));
+}
+
+test("旧数据迁移：缺原序列的体检仍可读、标明缺失，且不重算/不覆盖原结论", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "acoustic-migrate-"));
+  const dbFile = path.join(dir, "db.json");
+  const legacy = legacyCheckup({ status: "attention", statusLabel: "关注" });
+  const seed = {
+    clocks: [
+      {
+        id: "clock_demo",
+        code: "CLK-1890-07",
+        escapementType: "x",
+        balanceFrequency: "28800vph",
+        targetDailyRateSeconds: 20,
+        note: "",
+        createdAt: "2026-06-16T00:00:00.000Z"
+      }
+    ],
+    adjustments: [],
+    retests: [],
+    acousticCheckups: [legacy]
+  };
+  await writeDbFile(dbFile, seed);
+
+  const app = createApp(dbFile);
+  await new Promise((r) => app.server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  try {
+    const detail = await api(base, "GET", `/acoustic-checkups/${legacy.id}`);
+    assert.equal(detail.status, 200);
+    assert.equal(detail.json.data.rawSamplesAvailable, false);
+    assert.equal(detail.json.data.tickIntervalsMs, null);
+    assert.equal(detail.json.data.amplitudesDeg, null);
+    assert.equal(detail.json.data.metrics.beatErrorAvailable, false);
+    assert.equal(detail.json.data.metrics.beatPairCount, 0);
+    // 原结论与旧指标原样保留，迁移没有重算或改写
+    assert.equal(detail.json.data.status, "attention");
+    assert.equal(detail.json.data.statusLabel, "关注");
+    assert.equal(detail.json.data.metrics.stabilityPercent, 100);
+    assert.equal(detail.json.data.versions.length, 1);
+    assert.equal(detail.json.data.versions[0].reason, "首次体检结论");
+
+    // 列表与钟表摘要也带缺失标记
+    const list = await api(base, "GET", `${BASE}/acoustic-checkups`);
+    assert.equal(list.json.data[0].rawSamplesAvailable, false);
+    const summary = await api(base, "GET", "/clocks");
+    const demo = summary.json.data.find((c) => c.id === "clock_demo");
+    assert.equal(demo.latestAcousticCheckup.rawSamplesAvailable, false);
+    assert.equal(demo.latestAcousticCheckup.status, "attention");
+
+    // 迁移已原子落盘：磁盘上的旧记录被补标为缺失（显式 null），不伪造原序列，结论未变
+    const onDisk = JSON.parse(await readFile(dbFile, "utf8"));
+    const migrated = onDisk.acousticCheckups[0];
+    assert.equal(migrated.rawSamplesAvailable, false);
+    assert.equal(migrated.status, "attention");
+    assert.equal(migrated.tickIntervalsMs, null);
+    assert.equal(migrated.amplitudesDeg, null);
+    assert.equal(migrated.metrics.beatErrorAvailable, false);
+  } finally {
+    await new Promise((res, rej) => app.server.close((e) => (e ? rej(e) : res())));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("迁移不阻断新体检：旧记录缺失 + 新记录带完整序列可共存，重复提交仍只留首份", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "acoustic-mix-"));
+  const dbFile = path.join(dir, "db.json");
+  const legacy = legacyCheckup();
+  await writeDbFile(dbFile, {
+    clocks: [
+      { id: "clock_demo", code: "c", escapementType: "x", balanceFrequency: "28800vph", targetDailyRateSeconds: 20, note: "", createdAt: "2026-06-16T00:00:00.000Z" }
+    ],
+    adjustments: [],
+    retests: [],
+    acousticCheckups: [legacy]
+  });
+  const app = createApp(dbFile);
+  await new Promise((r) => app.server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  try {
+    const payload = makeSamples(24);
+    const first = await api(base, "POST", `${BASE}/acoustic-checkups`, payload);
+    assert.equal(first.status, 201);
+    assert.equal(first.json.data.rawSamplesAvailable, true);
+    const dup = await api(base, "POST", `${BASE}/acoustic-checkups`, payload);
+    assert.equal(dup.status, 200);
+    assert.equal(dup.json.duplicated, true);
+    assert.equal(dup.json.data.id, first.json.data.id);
+
+    const list = await api(base, "GET", `${BASE}/acoustic-checkups`);
+    assert.equal(list.json.data.length, 2);
+    const flags = list.json.data.map((c) => c.rawSamplesAvailable).sort();
+    assert.deepEqual(flags, [false, true]);
+  } finally {
+    await new Promise((res, rej) => app.server.close((e) => (e ? rej(e) : res())));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("迁移与并发写不产生半条记录：迁移进行中提交体检，落盘结果完整", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "acoustic-migrate-conc-"));
+  const dbFile = path.join(dir, "db.json");
+  const legacy = legacyCheckup();
+  await writeDbFile(dbFile, {
+    clocks: [
+      { id: "clock_demo", code: "c", escapementType: "x", balanceFrequency: "28800vph", targetDailyRateSeconds: 20, note: "", createdAt: "2026-06-16T00:00:00.000Z" }
+    ],
+    adjustments: [],
+    retests: [],
+    acousticCheckups: [legacy]
+  });
+
+  // 用提交前闸门确保体检写与启动迁移在写队列里相邻，且写过程对调用方是原子可见的。
+  const g = gate();
+  const app = createApp(dbFile, { beforeCheckupCommit: g.hook });
+  await new Promise((r) => app.server.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${app.server.address().port}`;
+  try {
+    const payload = makeSamples(24);
+    const first = api(base, "POST", `${BASE}/acoustic-checkups`, payload);
+    await g.entered; // 体检已进入写队列（迁移要么已完成、要么排在它前面）
+    g.release();
+    const created = await first;
+    assert.equal(created.status, 201);
+
+    // 落盘文件始终是完整 JSON：迁移补标旧记录 + 新记录完整序列，缺一不可。
+    const onDisk = JSON.parse(await readFile(dbFile, "utf8"));
+    assert.equal(onDisk.acousticCheckups.length, 2);
+    const old = onDisk.acousticCheckups.find((c) => c.id === legacy.id);
+    const fresh = onDisk.acousticCheckups.find((c) => c.id === created.json.data.id);
+    assert.equal(old.rawSamplesAvailable, false);
+    assert.equal(fresh.rawSamplesAvailable, true);
+    assert.deepEqual(fresh.tickIntervalsMs, payload.tickIntervalsMs);
+    assert.deepEqual(fresh.amplitudesDeg, payload.amplitudesDeg);
+    assert.equal(fresh.versions.length, 1);
+  } finally {
+    g.release();
+    await new Promise((res, rej) => app.server.close((e) => (e ? rej(e) : res())));
     await rm(dir, { recursive: true, force: true });
   }
 });

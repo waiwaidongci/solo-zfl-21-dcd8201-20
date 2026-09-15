@@ -16,7 +16,7 @@ npm start
 npm test          # node --test，零依赖
 ```
 
-覆盖：离群点剔除、样本边界（19/20、剔除后不足）、重复提交、并发（同采样去重 / 不同采样只冻结一份）、复核推翻与版本保留、重启持久化、旧接口回归。
+覆盖：左右交替失衡（成对节拍偏差）、成对缺失、离群点不污染成对统计、样本边界（19/20、剔除后不足）、原始序列持久化与重启可读、旧数据迁移（缺原序列标缺失且不改结论）、重复提交、并发（同采样去重 / 不同采样只冻结一份 / 迁移与写不产生半条记录）、复核推翻与版本保留、旧接口回归。
 
 ## 原有接口（保持不变）
 
@@ -51,14 +51,14 @@ npm test          # node --test，零依赖
 - `balanceFrequency` 可省略，默认用钟表档案上的频率；支持 `28800vph`、`28800`、`4Hz`（Hz 按 ×3600 换算）。
 - 两个序列必须等长、滴答间隔为正数、摆幅非负，否则 `400`。
 - **有效样本（剔除离群点后）少于 20 个：返回 `422`，拒绝且不写任何记录。**
-- 成功 `201`，返回体含 `metrics`、`status`、`statusLabel`、`outlierCount`、`outlierIndexes`、`fingerprint`、`versions` 等。
+- 成功 `201`，返回体含 `metrics`、`status`、`statusLabel`、`outlierCount`、`outlierIndexes`、`fingerprint`、`versions`，以及完整有序的 `tickIntervalsMs` / `amplitudesDeg` 与 `rawSamplesAvailable`。
 
 ### 离群剔除与指标
 
 - 以滴答间隔中位数的 **MAD（中位绝对偏差）3.5 倍**为稳健阈值剔除离群点（漏跳/误触发）；MAD 为 0（走时极均匀）时退化为「与期望周期偏差 > 5%」判据，避免误删正常滴答。
 - 指标：
-  - `beatErrorMs` 节拍偏差 = 清洗后平均间隔 − 期望周期（`3600000 / vph`）
-  - `dailyRateSeconds` 日差（秒/天，带符号）
+  - `beatErrorMs` **节拍偏差（左右失衡）**：擒纵左右交替发声，若取「平均周期 − 目标周期」，左右两半周期的长短差会相互抵消而恒为零。因此用清洗后**仍相邻**的有效滴答组成左右对，取每对失衡 `|左−右| / 2`，再跨对取**中位数**（稳健）。被离群点打断的相邻对跳过，离群滴答不参与统计；没有任何成对样本时为 `null`。配套字段 `beatErrorAvailable` 与 `beatPairCount`。
+  - `dailyRateSeconds` **日差（秒/天，带符号）仍按平均周期与目标周期之差计算**，不因节拍偏差口径变化而改动。
   - `intervalNoiseMs` 噪声 = 间隔标准差；`noiseRatioPercent` = 噪声 / 期望周期
   - `stabilityPercent` 稳定度 = 100 − 噪声占比
   - `avgAmplitudeDeg`、`amplitudeStdDevDeg`、`amplitudeDropDeg`（首末摆幅差）
@@ -66,6 +66,11 @@ npm test          # node --test，零依赖
   - `healthy` 健康
   - `attention` 关注：|日差| > 20s、噪声占比 > 1%、平均摆幅 < 220°、摆幅标准差 > 20°
   - `abnormal` 异常：|日差| > 60s、噪声占比 > 2%、平均摆幅 < 200°、摆幅衰退 ≥ 30°
+
+### 原始序列持久化与旧数据迁移
+
+- 每条体检记录**原样保存完整、有序的 `tickIntervalsMs` 与 `amplitudesDeg`**，重启后经详情/列表接口仍可返回，供人工复核；`rawSamplesAvailable:true` 标明原序列可得。钟表摘要只带 `rawSamplesAvailable` 标记，不内联大序列。
+- 升级前写入的旧记录没有原序列：读取时标记 `rawSamplesAvailable:false`、两序列返回 `null`、`metrics.beatErrorAvailable:false`，且**不会据此重算或覆盖原结论/旧指标**。服务启动时经写队列做一次性原子迁移补标，迁移与并发体检写入都不会产生半条记录。
 
 ### 重复与并发
 

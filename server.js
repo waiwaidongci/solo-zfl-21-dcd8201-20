@@ -65,6 +65,33 @@ const routes = [
 
 /* ---------------- 持久化：写互斥 + 原子写，保证并发只冻结一份结论 ---------------- */
 
+// 归一化单条体检：标注原序列是否可得。旧记录没有原始滴答/摆幅序列，
+// 只做只读式标记（rawSamplesAvailable=false、序列置 null），绝不据此重算或覆盖结论。
+function normalizeCheckup(item) {
+  const hasRaw =
+    Array.isArray(item.tickIntervalsMs) &&
+    Array.isArray(item.amplitudesDeg) &&
+    item.tickIntervalsMs.length > 0;
+  const srcMetrics = item.metrics || {};
+  // 成对节拍偏差的可得性标注放在 metrics 内（与 analyzeAcoustic 输出对齐）。
+  // 旧记录无原序列：补 false/0 仅作缺失标注，绝不重算或改动 beatErrorMs、日差或结论。
+  const metrics = {
+    ...srcMetrics,
+    beatErrorAvailable: hasRaw ? Boolean(srcMetrics.beatErrorAvailable) : false,
+    beatPairCount: hasRaw ? Number(srcMetrics.beatPairCount || 0) : 0
+  };
+  return {
+    ...item,
+    metrics,
+    rawSamplesAvailable: hasRaw,
+    tickIntervalsMs: hasRaw ? item.tickIntervalsMs : null,
+    amplitudesDeg: hasRaw ? item.amplitudesDeg : null,
+    // 顶层也提供一份便于摘要/过滤使用。
+    beatErrorAvailable: metrics.beatErrorAvailable,
+    beatPairCount: metrics.beatPairCount
+  };
+}
+
 function createStore(dbFile, seed) {
   let chain = Promise.resolve();
   let ready = null;
@@ -89,7 +116,7 @@ function createStore(dbFile, seed) {
       clocks: db.clocks || [],
       adjustments: db.adjustments || [],
       retests: db.retests || [],
-      acousticCheckups: db.acousticCheckups || []
+      acousticCheckups: (db.acousticCheckups || []).map(normalizeCheckup)
     };
   }
 
@@ -97,6 +124,24 @@ function createStore(dbFile, seed) {
     if (!ready) ready = ensureDb();
     await ready;
     return normalize(JSON.parse(await readFile(dbFile, "utf8")));
+  }
+
+  // 一次性迁移：把旧版体检记录补标 rawSamplesAvailable。经写队列 + 原子写完成，
+  // 迁移过程不会产生半条记录；无旧记录时不落盘。返回被迁移的记录数。
+  async function migrate() {
+    await (ready || (ready = ensureDb()));
+    let raw;
+    try {
+      raw = JSON.parse(await readFile(dbFile, "utf8"));
+    } catch {
+      return 0;
+    }
+    const checkups = raw.acousticCheckups || [];
+    const needsMigration = checkups.some((c) => c.rawSamplesAvailable === undefined);
+    if (!needsMigration) return 0;
+    return await mutate(() => undefined).then(
+      () => checkups.filter((c) => c.rawSamplesAvailable === undefined).length
+    );
   }
 
   // 读-改-写在同一把队列锁里串行化，杜绝并发体检互相覆盖。
@@ -115,7 +160,7 @@ function createStore(dbFile, seed) {
     return run;
   }
 
-  return { read: readRaw, mutate };
+  return { read: readRaw, mutate, migrate };
 }
 
 /* ---------------- 声学分析 ---------------- */
@@ -210,6 +255,29 @@ function removeOutliers(intervals, amplitudes, expectedMs) {
   };
 }
 
+// 节拍偏差：擒纵左右交替时，若只取「平均周期 − 目标周期」，左右两半周期的
+// 长短差会在平均里相互抵消而显示为零。因此按相邻有效滴答组成左右对，
+// 用每对失衡 |左−右|/2 跨对取中位数做稳健统计。
+// 只用在原序列里仍相邻的有效滴答：被离群点打断（索引不连续）的跨点对不算。
+function beatErrorFromPairs(cleaned) {
+  const imbalances = [];
+  for (let k = 0; k + 1 < cleaned.kept.length; k++) {
+    const idxA = cleaned.kept[k];
+    const idxB = cleaned.kept[k + 1];
+    if (idxB !== idxA + 1) continue; // 中间有离群点被剔除，不能跨点配对
+    imbalances.push(Math.abs(cleaned.intervals[k] - cleaned.intervals[k + 1]) / 2);
+  }
+  if (imbalances.length === 0) {
+    return { beatErrorMs: null, beatErrorAvailable: false, beatPairCount: 0 };
+  }
+  const sorted = imbalances.slice().sort((a, b) => a - b);
+  return {
+    beatErrorMs: round3(median(sorted)),
+    beatErrorAvailable: true,
+    beatPairCount: imbalances.length
+  };
+}
+
 function classify(metrics) {
   // 异常：日差过大、噪声过高，或摆幅不足/明显衰退
   if (
@@ -255,10 +323,14 @@ function analyzeAcoustic({ vph, tickIntervalsMs, amplitudesDeg }) {
   const avgIntervalMs = mean(cleaned.intervals);
   const intervalNoiseMs = stdDev(cleaned.intervals);
   const noiseRatioPercent = (intervalNoiseMs / expectedMs) * 100;
+  // 节拍偏差来自相邻左右对失衡；日差仍按平均周期与目标周期之差计算，保持不变。
+  const beat = beatErrorFromPairs(cleaned);
   const metrics = {
     expectedIntervalMs: round3(expectedMs),
     avgIntervalMs: round3(avgIntervalMs),
-    beatErrorMs: round3(avgIntervalMs - expectedMs), // 节拍偏差：实测周期 − 期望周期
+    beatErrorMs: beat.beatErrorMs, // 相邻左右对失衡 |左−右|/2 的跨对中位数；无成对样本为 null
+    beatErrorAvailable: beat.beatErrorAvailable,
+    beatPairCount: beat.beatPairCount,
     dailyRateSeconds: round3(((avgIntervalMs - expectedMs) / expectedMs) * 86400),
     intervalNoiseMs: round3(intervalNoiseMs), // 噪声：滴答间隔标准差
     noiseRatioPercent: round3(noiseRatioPercent),
@@ -356,6 +428,7 @@ function clockSummary(db, clock) {
           status: acousticCheckup.status,
           statusLabel: acousticCheckup.statusLabel,
           metrics: acousticCheckup.metrics,
+          rawSamplesAvailable: acousticCheckup.rawSamplesAvailable,
           createdAt: acousticCheckup.createdAt
         }
       : null,
@@ -380,9 +453,13 @@ function createApp(dbFile = DEFAULT_DB_FILE, hooks = {}) {
   // clockId -> 当前占用的指纹：同一机芯并发体检只允许冻结一份结论。
   const busyClock = new Map();
 
+  // 启动即做只读式迁移；经写队列串行，迁移与任何体检写都不会交错出半条记录。
+  const migrated = store.migrate().catch(() => 0);
+
   async function handle(req, res) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const pathname = url.pathname;
+    await migrated;
     const db = await store.read();
 
     if (req.method === "GET" && pathname === "/health") {
@@ -539,7 +616,7 @@ function createApp(dbFile = DEFAULT_DB_FILE, hooks = {}) {
           if (existing) return { checkup: existing, duplicated: true, statusCode: 200 };
 
           const now = new Date().toISOString();
-          const checkup = {
+          const checkup = normalizeCheckup({
             id: makeId("acoustic"),
             clockId: clock.id,
             fingerprint,
@@ -549,6 +626,10 @@ function createApp(dbFile = DEFAULT_DB_FILE, hooks = {}) {
             cleanedSampleCount: result.cleanedSampleCount,
             outlierCount: result.outlierCount,
             outlierIndexes: result.outlierIndexes,
+            // 完整、有序的原始序列原样落盘，重启后仍可返回与人工复核。
+            tickIntervalsMs: intervals.slice(),
+            amplitudesDeg: amplitudes.slice(),
+            rawSamplesAvailable: true,
             metrics: result.metrics,
             status: result.status,
             statusLabel: result.statusLabel,
@@ -565,7 +646,7 @@ function createApp(dbFile = DEFAULT_DB_FILE, hooks = {}) {
                 createdAt: now
               }
             ]
-          };
+          });
           draft.acousticCheckups.push(checkup);
           return { checkup, duplicated: false, statusCode: 201 };
         });
@@ -716,4 +797,12 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { createApp, startServer, analyzeAcoustic, parseFrequency, MIN_VALID_SAMPLES };
+module.exports = {
+  createApp,
+  startServer,
+  analyzeAcoustic,
+  parseFrequency,
+  beatErrorFromPairs,
+  normalizeCheckup,
+  MIN_VALID_SAMPLES
+};
